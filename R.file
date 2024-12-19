@@ -1,0 +1,169 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load libraries
+x <- c("ggpubr", "plyr", "plotly", "scales", "xgboost", 
+       "recipes", "svglite", "biglasso",
+       "randomForest", "caret",
+       "FactoMineR", "NbClust", "glmnet", "gtools",
+       "gplots", "ggplot2",  "pROC", "MLeval", "ROCR",
+       "RColorBrewer", "dunn.test", "rstatix", "emmeans",
+       "matrixTests", "viridis", "pheatmap", "gridExtra",
+       "factoextra", "openxlsx", "xlsx2dfs", "logistf",
+       "EnhancedVolcano",  "readxl", "mixOmics", "ggsignif",
+       "plotrix", "lme4", "ranger",
+       "ggbreak", "clValid",  "KernelKnn", "arm", "reshape2",
+       "uwot",  "broom", "tidyverse")
+lapply(x, library, character.only = TRUE)
+
+# Control function conflicts
+library(conflicted)
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflict_prefer("summarize", "dplyr")
+conflict_prefer("arrange", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("lag", "dplyr")
+conflict_prefer("summarise", "dplyr")
+conflicts_prefer(plyr::desc)
+
+```
+```{r "Load and process data"}
+# Load data
+dat.og <- read.xlsx("data_files/data_COMBAT.xlsx",
+                 colNames = TRUE,
+                 rowNames = TRUE)
+
+# Clinical data
+dat.clins <- dat.og[1:206] %>% 
+  rownames_to_column("rownames")
+
+### Process proteomics
+# Subset patient data
+dat.prots <- dat.og %>% filter(Timepoint != "HC")
+dat.prots <- as.data.frame(t(dat.prots[ , c(which(colnames(dat.prots) == "IGKV3_7"):which(colnames(dat.prots) == "COLEC10"))]))
+
+# Remove constant features
+dat.prots <- dat.prots[apply(dat.prots, MARGIN = 1, FUN = function(x) sd(x) != 0), ]
+
+# Remove features with > 95% missing values; impute 20% for missing values for each feature
+dat.prots[dat.prots <= 1.1] <- NA 
+dat.prots <- as.data.frame(t(dat.prots))
+dat.prots <- dat.prots %>%
+  select_if(~mean(is.na(.)) <= 0.95)
+dat.prots <- as.data.frame(t(dat.prots))
+dat.prots_min <- numeric(length = length(rownames(dat.prots)))
+for (i in 1:length(rownames(dat.prots))) {
+  dat.prots_min[i] <- 0.2*(min(dat.prots[i , ], na.rm = TRUE))
+}
+for (i in 1:length(rownames(dat.prots))) {
+  for (j in 1:length(colnames(dat.prots))) {
+    if (is.na(dat.prots[i , j])) {
+      dat.prots[i , j] <- dat.prots_min[i]
+    }
+  }
+}
+dat.prots <- as.data.frame(t(dat.prots))
+prots <- names(dat.prots)
+
+# Healthy control proteomics
+prots.hc <- dat.og %>% filter(Timepoint_hr == "HC") %>% select(names(dat.prots))
+prots.hc[prots.hc <= 1.1] <- NA
+prots.hc_min <- numeric(length = length(rownames(prots.hc)))
+for (i in 1:length(rownames(prots.hc))) {
+  prots.hc_min[i] <- 0.2*(min(prots.hc[i , ], na.rm = TRUE))
+}
+for (i in 1:length(rownames(prots.hc))) {
+  for (j in 1:length(colnames(prots.hc))) {
+    if (is.na(prots.hc[i , j])) {
+      prots.hc[i , j] <- prots.hc_min[i]
+    }
+  }
+}
+dat.prots <- bind_rows(prots.hc, dat.prots)
+dat.prots <- rownames_to_column(dat.prots, "rownames")
+
+### Process metabolomics
+# Subset patient data
+dat.mets <- dat.og %>%
+  filter(Timepoint != "HC")
+dat.mets <- as.data.frame(dat.mets[ , which(colnames(dat.og) == "D_Glucose"):which(colnames(dat.og) == "Caffeoylglucose")])
+
+# Impute missing values with 20% lowest value for each feature 
+dat.mets[dat.mets < 100] <- NA
+dat.mets <- dat.mets[-which(colSums(dat.mets, na.rm = TRUE) == 0)]
+dat.mets <- as.data.frame(apply(dat.mets, 2, function(x) {replace(x, is.na(x), (min(x, na.rm = TRUE))/5)}))
+dat.mets[dat.mets < 100] <- 100
+mets <- names(dat.mets)
+omics <- c(prots, mets)
+
+# Healthy control metabolomics
+mets.hc <- dat.og %>% filter(Timepoint_hr == "HC") %>% select(names(dat.mets))
+mets.hc[mets.hc < 100] <- NA
+mets.hc <- as.data.frame(apply(mets.hc, 2, function(x) {replace(x, is.na(x), (min(x, na.rm = TRUE))/5)})) # NEW
+mets.hc[mets.hc < 100] <- 100
+dat.mets <- bind_rows(mets.hc, dat.mets)
+dat.mets <- rownames_to_column(dat.mets, "rownames")
+dat.mets <- dat.mets %>%
+  mutate(across(.cols = everything(), 
+                .fns = ~ifelse(. == Inf, min(.[. != Inf], na.rm = TRUE), .)))
+
+# Final df
+dat.omics <- left_join(dat.prots, dat.mets, by = "rownames")
+dat.og <- left_join(dat.clins, dat.omics, by = "rownames")
+
+dat.clins <- column_to_rownames(dat.clins, "rownames")
+dat.prots <- column_to_rownames(dat.prots, "rownames")
+dat.mets <- column_to_rownames(dat.mets, "rownames")
+dat.og <- column_to_rownames(dat.og, "rownames")
+
+### Define common functions and variables
+# Function for data summary table
+data_summary <- function(data, varname, groupnames){
+  summary_func <- function(x, col){
+    c(median = median(x[[col]], na.rm=TRUE),
+      sem = std.error(x[[col]], na.rm=TRUE))
+  }
+  data_sum <- plyr::ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- plyr::rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+# Shock/Trauma colors
+HC <- "#20854EFF"
+Q1 <- "#E18727FF" # LSHT
+Q2 <- "#BC3C29FF" # HSHT
+Q3 <- "#0072B5FF" # HSLT
+Q4 <- "#6F99ADFF" # LSLT
+
+# Another color vector
+c25 <- c("black","#E31A1C","dodgerblue2","#FF7F00","#6A3D9A", 
+         "gold1", "skyblue2", "#FB9A99","green4","palegreen2",
+         "#FDBF6F","gray70", "maroon", "orchid1", "steelblue4",
+         "darkturquoise", "yellow3", "green4","#CAB2D6",
+         "deeppink1", "blue1",  "green1", "yellow4","orange", 
+         "brown", "#E31A1C", "green4")
+
+# Patient states colors
+cols.ps <- list(mets = brewer.pal(8, "BrBG"),
+             prots = brewer.pal(8, "RdBu"),
+             omics = brewer.pal(8, "PRGn"))
+
+# Trajectory colors
+cols.trajs <- list(mets = c25[10:16],
+                 omics = c(c25[c(1,2,3,4,5,6,7,12,16)]),
+                 prots = c("#662F00", "#996035", "#D8AF97", "#F2DACD",
+                           "#32E3FF", "#007A99", "gray70"))
+
+# Continuous clinical variables
+continuous <- c("SBP", "DBP", "HR", "GCS", "Temp", "pH", "pa_CO2", "pa_O2", "Bicarb", "BE", "BD", "Potassium", "VCO2", "Creatinine_labs", "Glucose", "Calcium", "ion_Calcium", "Lactate_labs", "WBC", "HGB", "HCT", "Plt_count", "INR", "PTT", "Fibrinogen", "DDimer", "coag.plasm", "coag.F2", "coag.F5", "coag.F7", "coag.F8", "coag.F9", "coag.F11", "rteg_act", "rteg_sp", "rteg_r", "rteg_k", "rteg_angle", "rteg_ma", "rteg_g", "rteg_ly30", "cit_rteg_r", "cit_rteg_act", "cit_rteg_sp", "cit_rteg_k", "cit_rteg_angle", "cit_rteg_ma", "cit_rteg_g", "cit_rteg_ly30", "cit_rteg_ly60",  "cit_rteg_cl30", "cit_rteg_cl60", "cn_tpa75_ly30", "cn_tpa150_ly30", "cn_tpa75_ly60", "cn_tpa75_r", "cn_tpa75_k", "cn_tpa75_angle", "cn_tpa75_ma", "cn_r", "cn_k", "cn_angle", "cn_ma", "cn_ly30", "cnly60", "dly30", "dly60", "crystalloid.ml", "rbc.units", "ffp.units", "plt.units", "cryo.units", "txa.mg") #removed aca.g, only 0s and NA
+
+# Fixed continuous clinical variables
+fixed_continuous <- c("Age", "BMI", "Height_m", "Weight_kg", "Ncomorbid", "lungof_severity", "heartof_severity", "liverof_severity", "kidneyof_severity", "mofmaxscore", "Max_AIS_head", "Max_AIS_Head_Neck", "Max_AIS_Face", "Max_AIS_Chest", "Max_AIS_Abd", "Max_AIS_Abd_Pelvis", "Max_AIS_Skin", "Max_AIS_Extremities", "Max_AIS_External", "NISS", "BE_ED", "Hospital_days", "Hospital_free_days", "ICU_free_days", "Vent_free_days", "RBC_12hrs", "FFP_12hrs", "Plat_12hrs", "Cryo_12hrs", "MTX", "Total_6hr_Crystalloid.mL", "Total_6hr_RBC.u", "Total_6hr_FFP.u", "Total_6hr_Plt.u", "Total_6hr_Cryo.u", "Total_6hr_ACA.g", "Total_6hr_TXA.mg", "Total_24hr_Crystalloid.mL", "Total_24hr_RBC.u", "Total_24hr_FFP.u", "Total_24hr_Plt.u", "Total_24hr_Cryo.u", "Total_24hr_ACA.g", "Total_24hr_TXA.mg")
+
+# Categorical clinical data
+categorical <- c("Sex", "Race", "Ethnicity", "Pre_obesity", "Pre_cardiac", "Pre_renal", "Pre_coagulopathy", "Pre_diabetes", "Pre_HIV", "Pre_immunosupression", "Pre_liver", "Pre_lung", "Pre_anticoagmeds", "Comorbid", "Pre_APA", "Pre_ASA", "Pre_statin", "ALI", "lungof", "heartof", "liverof", "kidneyof", "AS_treated", "Injury_type", "Injury_Mechanism", "Injury_Mechanism_Num", "ED_ethanol_result", "ED_amphetamines", "ED_barbiturates", "ED_benzodiazepines", "ED_cocainemetabolites", "ED_methadone", "ED_opioids", "Discharge_disposition", "TBI", "Death", "Quadrant")
+
+```
